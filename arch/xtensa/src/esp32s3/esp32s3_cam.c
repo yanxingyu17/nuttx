@@ -36,6 +36,8 @@
 #include <nuttx/spinlock.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/semaphore.h>
+#include <nuttx/cache.h>
+#include <nuttx/wqueue.h>
 #include <nuttx/video/imgdata.h>
 
 #include <arch/board/board.h>
@@ -70,13 +72,13 @@
 
 /* DMA buffer configuration */
 
-#define ESP32S3_CAM_DMA_BUFLEN    4096
-#define ESP32S3_CAM_DMADESC_NUM   60
+#define ESP32S3_CAM_DMA_BUFLEN    3840
+#define ESP32S3_CAM_DMADESC_NUM   56
 #define ESP32S3_CAM_HALF_BUF_SIZE 15360
 
 /* VSYNC filter threshold */
 
-#define ESP32S3_CAM_VSYNC_FILTER  4
+#define ESP32S3_CAM_VSYNC_FILTER  7
 
 /****************************************************************************
  * Private Types
@@ -94,15 +96,19 @@ struct esp32s3_cam_s
 
   struct esp32s3_dmadesc_s dmadesc[ESP32S3_CAM_DMADESC_NUM];
 
-  uint8_t *fb;                    /* Frame buffer */
-  uint32_t fb_size;               /* Frame buffer size */
+  uint8_t *fb;                    /* DMA frame buffer (with overflow) */
+  uint8_t *v4l2_buf;              /* V4L2 userptr buffer (no overflow) */
+  uint32_t fb_size;               /* Frame size in bytes */
+  uint32_t fb_alloc;              /* DMA buffer allocated size */
   uint32_t fb_pos;                /* Current write position */
   uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
   uint32_t dma_received;          /* Bytes received by DMA so far */
   int dma_desc_offset;            /* Next DMA descriptor index to load */
 
-  imgdata_capture_t cb;           /* Capture done callback */
-  void *cb_arg;                   /* Callback argument */
+  imgdata_capture_t cb;
+  void *cb_arg;
+  struct work_s frame_work;
+  struct timeval frame_ts;
 
   int dma_cpuint;
   uint16_t width;
@@ -160,6 +166,26 @@ static struct esp32s3_cam_s g_cam_priv =
  * Private Functions
  ****************************************************************************/
 
+static void frame_complete_worker(void *arg)
+{
+  struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
+
+  if (priv->cb == NULL || priv->fb == NULL)
+    {
+      return;
+    }
+
+  up_invalidate_dcache((uintptr_t)priv->fb,
+                       (uintptr_t)priv->fb + priv->fb_size);
+
+  if (priv->v4l2_buf != NULL)
+    {
+      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
+    }
+
+  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
+}
+
 /****************************************************************************
  * Name: cam_interrupt
  *
@@ -197,10 +223,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
             }
           else if (priv->vsync_cnt >= 2 && priv->cb)
             {
-              struct timeval ts;
               uint32_t regval;
-
-              /* Stop capture */
 
               regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
               regval &= ~LCD_CAM_CAM_START_M;
@@ -210,48 +233,24 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
               regval |= LCD_CAM_CAM_UPDATE_REG_M;
               putreg32(regval, LCD_CAM_CAM_CTRL_REG);
 
-              gettimeofday(&ts, NULL);
+              SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
+                               priv->dma_channel,
+                               DMA_INLINK_STOP_CH0_M);
 
-              syslog(LOG_INFO, "CAM: frame done, eof_cnt=%lu desc_off=%d\n",
-                     (unsigned long)priv->dma_received,
-                     priv->dma_desc_offset);
-              priv->cb(0, priv->fb_size, &ts, priv->cb_arg);
+              {
+                uint32_t regaddr = DMA_IN_LINK_CH0_REG +
+                    priv->dma_channel * GDMA_REG_OFFSET;
+                int tries = 1000;
+                while (tries-- > 0 &&
+                       !(getreg32(regaddr) & DMA_INLINK_PARK_CH0))
+                  {
+                  }
+              }
 
-              /* Restart capture for next frame */
-
-              priv->vsync_cnt = 0;
-
-              /* Reset DMA */
-
-              esp32s3_dma_reset_channel(priv->dma_channel, false);
-
-              /* Reset CAM + AFIFO */
-
-              regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
-              regval |= LCD_CAM_CAM_RESET_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
-              regval &= ~LCD_CAM_CAM_RESET_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
-
-              regval |= LCD_CAM_CAM_AFIFO_RESET_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
-              regval &= ~LCD_CAM_CAM_AFIFO_RESET_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
-
-              /* Reload DMA descriptors */
-
-              esp32s3_dma_load(priv->dmadesc, priv->dma_channel, false);
-              esp32s3_dma_enable(priv->dma_channel, false);
-
-              /* Restart */
-
-              regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
-              regval |= LCD_CAM_CAM_START_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
-
-              regval = getreg32(LCD_CAM_CAM_CTRL_REG);
-              regval |= LCD_CAM_CAM_UPDATE_REG_M;
-              putreg32(regval, LCD_CAM_CAM_CTRL_REG);
+              priv->capturing = false;
+              gettimeofday(&priv->frame_ts, NULL);
+              work_queue(LPWORK, &priv->frame_work,
+                         frame_complete_worker, priv, 0);
             }
         }
     }
@@ -429,7 +428,9 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
 
   putreg32(0, LCD_CAM_CAM_RGB_YUV_REG);
 
-  /* Setup DMA */
+  CLR_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG, priv->dma_channel,
+                   DMA_INDSCR_BURST_EN_CH0_M |
+                   DMA_IN_DATA_BURST_EN_CH0_M);
 
   if (esp32s3_cam_dmasetup(priv) != OK)
     {
@@ -525,6 +526,8 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
   uint32_t regval;
 
+  work_cancel_sync(LPWORK, &priv->frame_work);
+
   /* Stop capture */
 
   regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
@@ -568,8 +571,8 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
                                uint8_t *addr, uint32_t size)
 {
   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
-
-  /* Store negotiated format from upper layer */
+  uint32_t needed_size;
+  uint32_t alloc_size;
 
   priv->width  = datafmts[IMGDATA_FMT_MAIN].width;
   priv->height = datafmts[IMGDATA_FMT_MAIN].height;
@@ -577,47 +580,35 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
 
   if (addr != NULL && size > 0)
     {
-      uint32_t alloc_size = size + ESP32S3_CAM_HALF_BUF_SIZE * 3;
-      priv->fb = kmm_memalign(64, alloc_size);
-      if (!priv->fb)
-        {
-          priv->fb = addr;
-          priv->fb_size = size;
-        }
-      else
-        {
-          priv->fb_size = size;
-          memset(priv->fb, 0, alloc_size);
-        }
+      needed_size = size;
+      priv->v4l2_buf = addr;
     }
   else
     {
-      /* Allocate frame buffer in PSRAM if available.
-       * 8-bit DVP formats (RGB565, YUV422) are all 2 bytes per pixel.
-       */
+      needed_size = priv->width * priv->height * 2;
+      priv->v4l2_buf = NULL;
+    }
 
-      priv->fb_size = priv->width * priv->height * 2;
-      priv->fb = kmm_memalign(64, priv->fb_size);
+  alloc_size = needed_size + ESP32S3_CAM_HALF_BUF_SIZE * 3;
+
+  if (priv->fb == NULL || priv->fb_size != needed_size)
+    {
+      if (priv->fb != NULL)
+        {
+          kmm_free(priv->fb);
+          priv->fb = NULL;
+        }
+
+      priv->fb = kmm_memalign(64, alloc_size);
       if (!priv->fb)
         {
           snerr("ERROR: Failed to allocate frame buffer\n");
           return -ENOMEM;
         }
 
-      syslog(LOG_INFO, "CAM: fb=%p size=%lu\n",
-             priv->fb, (unsigned long)priv->fb_size);
+      priv->fb_size = needed_size;
+      priv->fb_alloc = alloc_size;
     }
-
-  memset(priv->fb, 0, priv->fb_size);
-
-  /* Setup DMA descriptors for RX into frame buffer */
-
-  esp32s3_dma_setup(priv->dmadesc,
-                    ESP32S3_CAM_DMADESC_NUM,
-                    priv->fb,
-                    priv->fb_size + ESP32S3_CAM_HALF_BUF_SIZE * 3,
-                    false,
-                    priv->dma_channel);
 
   return OK;
 }
@@ -680,7 +671,43 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
   priv->dma_received = 0;
   priv->dma_desc_offset = 0;
 
-  memset(priv->fb, 0, priv->fb_size);
+  memset(priv->fb, 0, priv->fb_alloc);
+
+  /* Rebuild DMA descriptors (reset OWN bits consumed by prior DMA) */
+
+  {
+    uint8_t *pbuf = priv->fb;
+    uint32_t remaining = priv->fb_alloc;
+    uint32_t total_desc = (remaining + ESP32S3_CAM_DMA_BUFLEN - 1) /
+                          ESP32S3_CAM_DMA_BUFLEN;
+    uint32_t i;
+
+    for (i = 0; i < total_desc && i < ESP32S3_CAM_DMADESC_NUM; i++)
+      {
+        uint32_t data_len = remaining > ESP32S3_CAM_DMA_BUFLEN ?
+                            ESP32S3_CAM_DMA_BUFLEN : remaining;
+        uint32_t buf_len = (data_len + 63) & ~63;
+
+        priv->dmadesc[i].ctrl = ESP32S3_DMA_CTRL_OWN |
+            (buf_len << ESP32S3_DMA_CTRL_BUFLEN_S);
+        priv->dmadesc[i].pbuf = pbuf;
+
+        if (i < total_desc - 1)
+          {
+            priv->dmadesc[i].next = &priv->dmadesc[i + 1];
+          }
+        else
+          {
+            priv->dmadesc[i].next = NULL;
+          }
+
+        pbuf += data_len;
+        remaining -= data_len;
+      }
+  }
+
+  up_clean_dcache((uintptr_t)priv->fb,
+                  (uintptr_t)priv->fb + priv->fb_alloc);
 
   /* Stop CAM first */
 
@@ -722,6 +749,12 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
 
   priv->capturing = true;
 
+  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+                         CAM_V_SYNC_IDX, false);
+  up_udelay(10);
+  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+                         CAM_V_SYNC_IDX, true);
+
   return OK;
 }
 
@@ -734,8 +767,6 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
   uint32_t regval;
 
-  /* Stop capture */
-
   regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
   regval &= ~LCD_CAM_CAM_START_M;
   putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
@@ -745,6 +776,9 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
   putreg32(regval, LCD_CAM_CAM_CTRL_REG);
 
   priv->capturing = false;
+
+  work_cancel_sync(LPWORK, &priv->frame_work);
+
   priv->cb = NULL;
   priv->cb_arg = NULL;
 
